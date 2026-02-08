@@ -5,82 +5,9 @@
 **Target:** llama.cpp MoE Optimization for Low-VRAM Consumer GPUs
 
 ---
-
-## Document Revision History
-
-### Version 0.0.4 (2026-02-08) - Expert Usage Tracing
-
-**Major additions for debugging and profiling:**
-- **ADDED:** Task 0: Expert Usage Tracer (complete implementation guide)
-- **ADDED:** Expert tensor name extraction from llama.cpp model structure
-- **ADDED:** Runtime statistics tracking for expert activation patterns
-- **ADDED:** Optional tensor name logging during execution
-- **ADDED:** Configuration flags for tracer functionality
-- **ADDED:** Integration points in existing hook locations
-
-**Addresses debugging and profiling needs:**
-1. ✅ Track which experts are activated and how frequently
-2. ✅ Identify expert tensor names from model structure
-3. ✅ Optional real-time logging of expert usage
-4. ✅ Statistics aggregation for analysis
-5. ✅ Integration with existing Post-Fetch hooks
-
-### Version 0.0.3 (2026-02-07) - Implementation Guidance
-
-**Major additions for implementation guidance:**
-- **ADDED:** Critical Implementation Pitfalls section (expanded from v0.0.2)
-- **ADDED:** CUDA Context Access Strategy (3 approaches with pros/cons)
-- **ADDED:** LoRA Compatibility Matrix (hook-level behavior)
-- **ADDED:** Stream Coordination Best Practices
-- **ADDED:** Configuration Validation Checklist
-- **ADDED:** Debugging Environment Variables
-- **ADDED:** Testing Strategy (unit, integration, performance)
-- **ADDED:** Implementation Roadmap (3 phases)
-- **ADDED:** Common Error Messages and Solutions
-- **ADDED:** Performance Monitoring section
-
-**Addresses implementation concerns:**
-1. ✅ Model access strategy documented with 3 viable approaches
-2. ✅ LoRA compatibility clarified for both hook levels
-3. ✅ Stream synchronization best practices documented
-4. ✅ Configuration validation checklist added
-5. ✅ Testing strategy with concrete checklists
-6. ✅ Implementation roadmap with phased approach
-7. ✅ Common error messages and solutions reference
-8. ✅ Performance monitoring guidance
-
-### Version 0.0.2 (2025-02-07) - Review Corrections
-
-**Incorporates code review feedback:**
-- **REMOVED:** Duplicate buggy implementation snippet (lines 1131-1164 from v0.1.0)
-- **ADDED:** Model access strategies section (thread-local, extended context, tensor metadata)
-- **ADDED:** LoRA adapter considerations and compatibility analysis
-- **ADDED:** Stream coordination strategy with ggml's existing streams
-- **RESTRUCTURED:** Presented high-level hook as RECOMMENDED approach, backend-level as advanced
-- **CLARIFIED:** Implementation paths with clear trade-offs and recommendations
-
-**Addresses reviewer concerns:**
-1. ✅ Model context access mechanism explicitly defined
-2. ✅ LoRA compatibility explicitly addressed at both hook levels
-3. ✅ Stream management coordination with ggml clarified
-4. ✅ Removed editing error (duplicate code with old bug)
-5. ✅ Phased implementation approach (high-level → backend-level)
-
-### Version 0.0.1b (2025-02-07) - Implementation Fixes
-
-**Critical Implementation Fixes:**
-- Fixed memory layout bug: Changed from incorrect `i * size` to cumulative offset calculation
-- Fixed stream synchronization: Changed from `NULL` stream to proper `compute_stream` handling
-- Added missing CPU fallback logic with `cudaEventQuery()` checks
-- Updated hook point to reference actual llama.cpp code (`ggml_cuda_mul_mat_id`)
-- Corrected expert tensor access to use actual model structure
-- Added GPU scratchpad lifecycle management
-- Introduced separate `fetch_stream` and `compute_stream` for proper overlap
-- Added comprehensive debugging and validation sections
-
-### Version 0.0.1 (Original)
-- Initial conceptual design
-- Basic architecture and principles defined
+# Coding conventions
+C++ Standard:  C++17 and using more modern STL constructs.
+CUDA files will have extensions cuh/cu.
 
 ---
 
@@ -111,8 +38,9 @@ The Post-Fetch mechanism is designed for modern MoE models with varying expert c
 ## Table of Contents
 
 0. [Task 0: Expert Usage Tracer](#task-0-expert-usage-tracer)
-1. [Overview](#overview)
-2. [Key Principles](#key-principles)
+1. [Debug and Logging Facilities](#debug-and-logging-facilities)
+2. [Overview](#overview)
+3. [Key Principles](#key-principles)
 3. [Target Use Case](#target-use-case)
 4. [Technical Background](#technical-background)
 5. [How Post-Fetch Works](#how-post-fetch-works)
@@ -146,6 +74,126 @@ This tracer is implemented as a lightweight instrumentation layer that integrate
 | **Tensor Name Logging** | Print expert tensor names during execution | `--expert-trace-names` |
 | **Per-Layer Statistics** | Aggregate usage by layer | `--expert-trace-per-layer` |
 | **Export to File** | Save statistics to JSON/CSV | `--expert-trace-output <file>` |
+
+### Using llama.cpp's Built-in Logging Facilities
+
+**IMPORTANT:** llama.cpp already includes a comprehensive logging/debugging system that should be used for Task 0 instead of implementing custom logging. The existing facilities provide:
+
+- **Thread-safe logging** with worker threads for async operation
+- **Configurable verbosity** via environment variables
+- **Multiple output formats** (stderr, file, JSON)
+- **Minimal performance overhead** (<1% for stats, 5-10% for name logging)
+- **Integration with existing tools** (llama-debug, server logging)
+
+#### Available Logging Layers
+
+Layer | Header | Description |
+|-------|--------|-------------|
+**GGML** | `ggml/include/ggml.h` | Core logging with 6 levels (NONE, DEBUG, INFO, WARN, ERROR, CONT) |
+**Llama** | `src/llama-impl.h` | Extended logging with `LLAMA_LOG_*` macros |
+**Common** | `common/log.h` | Advanced logging with worker threads, timestamps, colors |
+
+#### Logging Macros
+
+```cpp
+// GGML layer
+GGML_LOG(...)
+GGML_LOG_INFO(...)
+GGML_LOG_WARN(...)
+GGML_LOG_ERROR(...)
+GGML_LOG_DEBUG(...)
+GGML_LOG_CONT(...)
+
+// Llama layer
+LLAMA_LOG(...)
+LLAMA_LOG_INFO(...)
+LLAMA_LOG_WARN(...)
+LLAMA_LOG_ERROR(...)
+LLAMA_LOG_DEBUG(...)
+LLAMA_LOG_CONT(...)
+
+// Common layer (recommended for Task 0)
+LOG(...)
+LOG_INF(...)
+LOG_WRN(...)
+LOG_ERR(...)
+LOG_DBG(...)
+LOG_CNT(...)
+```
+
+#### Environment Variables for Configuration
+
+Variable | Values | Description |
+|----------|--------|-------------|
+`LLAMA_EXPERT_TRACE_STATS` | `0` or `1` | Enable activation counting |
+`LLAMA_EXPERT_TRACE_NAMES` | `0` or `1` | Print tensor names during execution |
+`LLAMA_EXPERT_TRACE_PER_LAYER` | `0` or `1` | Track per-layer statistics |
+`LLAMA_EXPERT_TRACE_OUTPUT` | File path | Export statistics to JSON file |
+
+#### Recommended Implementation Approach
+
+Use the **Common Logging Layer** (`common/log.h`) for Task 0:
+
+```cpp
+#include "log.h"
+
+// Initialize at startup (in llama.cpp initialization)
+void init_expert_tracer() {
+    const char* env_stats = std::getenv("LLAMA_EXPERT_TRACE_STATS");
+    g_expert_stats.config.enable_stats = (env_stats != nullptr && std::string(env_stats) == "1");
+    
+    const char* env_names = std::getenv("LLAMA_EXPERT_TRACE_NAMES");
+    g_expert_stats.config.enable_name_logging = (env_names != nullptr && std::string(env_names) == "1");
+    
+    // ... rest of initialization
+}
+
+// Record expert usage (thread-safe with mutex)
+void expert_tracer_record_usage(
+    const llama_model * model,
+    const struct ggml_tensor * tensor,
+    int layer_id,
+    int expert_id
+) {
+    if (!g_expert_stats.config.enable_stats && !g_expert_stats.config.enable_name_logging) {
+        return;
+    }
+    
+    std::lock_guard<std::mutex> lock(g_expert_stats.stats_mutex);
+    
+    // Log tensor name if enabled
+    if (g_expert_stats.config.enable_name_logging) {
+        LOG_DBG("[EXPERT-TRACE] Layer %d, Expert %d: %s\n", layer_id, expert_id, tensor->name);
+    }
+    
+    // Update statistics if enabled
+    if (g_expert_stats.config.enable_stats) {
+        g_expert_stats.expert_activations[expert_id]++;
+        // ... rest of statistics
+    }
+}
+
+// Print statistics at end
+void expert_tracer_print_stats() {
+    LOG_INF("\n=== Expert Usage Statistics ===\n");
+    // ... print statistics
+}
+```
+
+#### Integration Points
+
+1. **High-Level Hook** (`build_moe_ffn()` in `src/llama-graph.cpp`)
+   - After routing selects experts
+   - Before expert computation begins
+   - Direct access to model structure
+
+2. **Context Initialization** (`llama_new_context_with_model()` in `src/llama.cpp`)
+   - Initialize expert tracer
+   - Load configuration from environment variables
+
+3. **Context Cleanup** (in `llama_free_context()`)
+   - Print statistics
+   - Export to JSON file if configured
 
 ### Expert Tensor Name Extraction
 
