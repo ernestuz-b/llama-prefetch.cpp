@@ -15,6 +15,8 @@ add_library(llama
             llama-chat.cpp
             llama-context.cpp
             llama-cparams.cpp
+            llama-expert-trace.cpp
+            llama-expert-trace.h
             llama-grammar.cpp
             llama-graph.cpp
             llama-hparams.cpp

@@ -8,6 +8,8 @@
 #include "llama-mmap.h"
 #include "llama-model.h"
 
+#include "llama-expert-trace.h"
+
 #include <cinttypes>
 #include <cmath>
 #include <cstring>
@@ -3042,6 +3044,8 @@ llama_context * llama_init_from_model(
 
     try {
         auto * ctx = new llama_context(*model, params);
+        // Initialize expert tracer (Phase 0)
+        llama_expert_tracer::instance().init(ctx);
         return ctx;
     } catch (const std::exception & err) {
         LLAMA_LOG_ERROR("%s: failed to initialize the context: %s\n", __func__, err.what());
@@ -3058,6 +3062,8 @@ llama_context * llama_new_context_with_model(
 }
 
 void llama_free(llama_context * ctx) {
+    // Cleanup expert tracer (Phase 0)
+    llama_expert_tracer::instance().cleanup(ctx);
     delete ctx;
 }
 

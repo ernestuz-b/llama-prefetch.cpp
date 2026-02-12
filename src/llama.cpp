@@ -13,6 +13,8 @@
 #include "ggml.h"
 #include "ggml-backend.h"
 
+#include "llama-expert-trace.h"
+
 #include <algorithm>
 #include <cassert>
 #include <cinttypes>
