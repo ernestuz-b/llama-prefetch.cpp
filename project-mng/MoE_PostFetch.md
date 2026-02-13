@@ -1,8 +1,23 @@
 # Post-Fetch MoE Execution
 
-**Version:** 0.0.5 (Callback-Based Expert Tracing) **Status:** Design Document **Target:** llama.cpp MoE Optimization for Low-VRAM Consumer GPUs
+**Version:** 0.0.7 (Implemented Callback Infrastructure) **Status:** Design Document **Target:** llama.cpp MoE Optimization for Low-VRAM Consumer GPUs
 
-**IMPORTANT UPDATE (2026-02-09):** This document has been updated to reflect actual llama.cpp codebase structure. Key changes:
+**IMPORTANT UPDATE (2026-02-13):** Phase 0 (Expert Usage Tracer) has been **IMPLEMENTED** with the following key findings:
+
+1. **Tensor naming convention** - Actual tensor names are `ffn_moe_gate-N`, `ffn_moe_up-N`, `ffn_moe_down-N` (not `blk.N.ffn_moe_...`)
+2. **Only process gate operations** - Must filter for `ffn_moe_gate` to avoid triple-counting (gate, up, down all have same expert IDs)
+3. **Tensor data padding** - The ids tensor may have padding between rows, requiring row-by-row reading using `nb[1]` stride
+4. **Callback return type** - The `on_eval` function must return `bool`, not `void`
+5. **Layer ID extraction** - Must handle both `blk.N.` and `-N` suffix patterns
+
+**Previous UPDATE (2026-02-13):** This document has been updated with a dedicated callback infrastructure to avoid collisions with user callbacks:
+
+1. **Added `cb_trace` callback** - Dedicated callback slot for tracing, separate from user's `cb_eval`
+2. **Fixed callback overwrite issue** - The original approach was overwritten by the graph build loop
+3. **Added prefetch callback design** - Future extension for prefetching functionality
+4. **Documented nullptr initialization** - All callback pointers must be initialized to `nullptr`
+
+**Previous UPDATE (2026-02-09):** 
 1. **Tensor naming convention corrected** - Now reflects actual 3D tensor structure (`blk.5.ffn_gate_exps` with dimensions `{n_embd, n_ff, n_expert}`)
 2. **Tensor lookup code corrected** - Now uses direct pointer access to layer structure instead of `ggml_get_tensor()` lookup
 3. **Context access corrected** - Now uses `ctx->get_sched()` accessor method consistently
@@ -14,7 +29,7 @@ See [`tools/imatrix/imatrix.cpp:253-254`](../tools/imatrix/imatrix.cpp:253-254) 
 
 # Coding conventions
 
-C++ Standard:  C++17 and using more modern STL. CUDA files will have extensions cuh/cu.
+C++ Standard:  C++17 and using more modern STL. CUDA files will have extensions cuh/cu.
 
 Cross-Platform Compatibility
 
@@ -92,7 +107,7 @@ The Post-Fetch mechanism is designed for modern MoE models with varying expert c
 
 ### Overview
 
-The Expert Usage Tracer leverages llama.cpp's existing callback system instead of implementing custom instrumentation. This significantly simplifies implementation and integrates seamlessly with existing debugging tools.
+The Expert Usage Tracer uses a **dedicated callback infrastructure** (`cb_trace`) to avoid collisions with user callbacks. This ensures reliable operation regardless of whether the user sets their own `cb_eval` callback.
 
 The tracer tracks:
 
@@ -102,25 +117,46 @@ The tracer tracks:
 
 3. **Expert selection pipeline** (logits → probabilities → weights → activations)
 
-### Callback-Based Architecture
+### Dedicated Callback Architecture
 
-Instead of custom instrumentation, we use two existing callback mechanisms:
+Instead of reusing the user's `cb_eval` callback slot, we add a dedicated `cb_trace` callback:
 
-| Callback Type | Purpose | Integration Point | Access to |
-| - | - | - | - |
-| **Graph Callback** (`llm_graph_cb`) | Track expert selection during graph building | `llama_graph_context::cb()` | Tensor names, shapes, layer indices |
-| **Eval Callback** (`ggml_backend_sched_eval_callback`) | Track expert usage during execution | `ggml_backend_sched_set_eval_callback()` | Tensor data, operation types |
+```cpp
+// In llama_context_params (include/llama.h)
+struct llama_context_params {
+    // ... existing members ...
+    
+    // User's callback (existing)
+    ggml_backend_sched_eval_callback cb_eval;
+    void * cb_eval_user_data;
+    
+    // Tracing callback (internal, for expert tracing, prefetching, etc.)
+    // IMPORTANT: Must be initialized to nullptr
+    ggml_backend_sched_eval_callback cb_trace = nullptr;
+    void * cb_trace_user_data = nullptr;
+    
+    // Future: Prefetch callback
+    // ggml_backend_sched_eval_callback cb_prefetch = nullptr;
+    // void * cb_prefetch_user_data = nullptr;
+};
+```
 
+### Why Not Use `cb_eval` Directly?
 
-### Key Features
+The original approach of calling `ggml_backend_sched_set_eval_callback()` directly had a critical flaw:
 
-| Feature | Description | Implementation Method |
-| - | - | - |
-| **Expert Selection Tracking** | Monitor which experts are chosen | Filter for `ffn_moe_topk` tensor in callbacks |
-| **Activation Counting** | Count expert usage per layer | Accumulate from `GGML_OP_MUL_MAT_ID` operations |
-| **Selection Pipeline** | Track logits → probs → weights | Monitor all 23 callback points in MoE pathway |
-| **Export Statistics** | Save to JSON/CSV | Post-processing of callback data |
+1. Expert tracer sets callback in `init()`
+2. Graph build loop at `llama-context.cpp:1141` calls `ggml_backend_sched_set_eval_callback(sched.get(), cparams.cb_eval, ...)` 
+3. This **overwrites** the expert tracer's callback with `nullptr` (the default)
 
+The dedicated `cb_trace` slot avoids this issue entirely.
+
+### Why Not Functors?
+
+While C++ functors would provide better type safety, llama.cpp uses C-style function pointers for:
+- C API compatibility
+- Simplicity and portability
+- Historical consistency with the codebase
 
 ### Callback Hook Points
 
@@ -138,53 +174,56 @@ The MoE pathway provides **23 callback points** (see [`Debugging_MoE_Experts.md`
 
 ### Implementation Strategy
 
-#### 1. Graph Callback for Expert Discovery
+#### 1. Add Dedicated Callback Infrastructure
 
-Use the `llm_graph_cb` callback to discover expert selection:
+Add `cb_trace` to the core structures:
 
+```cpp
+// In include/llama.h - llama_context_params
+ggml_backend_sched_eval_callback cb_trace = nullptr;  // MUST be nullptr
+void * cb_trace_user_data = nullptr;
+
+// In src/llama-cparams.h - llama_cparams  
+ggml_backend_sched_eval_callback cb_trace = nullptr;
+void * cb_trace_user_data = nullptr;
+
+// In ggml/src/ggml-backend.cpp - scheduler struct
+ggml_backend_sched_eval_callback callback_trace = nullptr;
+void * callback_trace_user_data = nullptr;
 ```
-// In llama-graph.cpp or new expert-trace.cpp file
-struct expert_trace_data {
-    std::unordered_map<int, std::unordered_map<int, int>> layer_expert_counts;
-    std::mutex trace_mutex;
-    bool enable_stats = false;
-    bool enable_logging = false;
-};
 
-// Global state (or in context struct)
-static expert_trace_data g_expert_trace;
+#### 2. Set Trace Callback in Context Initialization
 
-// Graph callback function
-void expert_trace_graph_cb(
-    const llama_ubatch & ubatch,
-    ggml_tensor * cur,
-    const char * name,
-    int il
-) {
-    if (!g_expert_trace.enable_stats && !g_expert_trace.enable_logging) {
-        return;
-    }
+```cpp
+// In llama_init_from_model() - BEFORE context creation
+llama_expert_tracer::instance().init_config();
+if (llama_expert_tracer::instance().is_enabled()) {
+    params.cb_trace = llama_expert_trace_eval_cb;
+    params.cb_trace_user_data = nullptr;  // Will be set to ctx after creation
+}
 
-    // Filter for MoE expert selection tensor
-    if (std::string(name) == "ffn_moe_topk") {
-        if (g_expert_trace.enable_logging) {
-            // Note: common_ggml_ne_string() is static in common/debug.cpp
-            // Use manual formatting instead
-            char shape_str[128];
-            snprintf(shape_str, sizeof(shape_str), "[%ld, %ld, %ld]",
-                     (long)cur->ne[0], (long)cur->ne[1], (long)cur->ne[2]);
-            LLAMA_LOG_DEBUG("[EXPERT-TRACE] Layer %d: Expert selection tensor '%s' shape=%s\n",
-                    il, name, shape_str);
-        }
+// Create context
+auto * ctx = new llama_context(*model, params);
 
-        // At this point, we know expert selection will happen
-        // Mark this layer as having MoE
-        // Store tensor for later data extraction (if needed)
-    }
+// After context creation
+llama_expert_tracer::instance().init(ctx);
+```
+
+#### 3. Invoke Trace Callback in Evaluation Loop
+
+```cpp
+// In ggml-backend.cpp evaluation loop (around line 1612)
+if (need && !sched->callback_eval(t, false, sched->callback_eval_user_data)) {
+    break;
+}
+
+// Also invoke trace callback (if set)
+if (sched->callback_trace) {
+    sched->callback_trace(t, false, sched->callback_trace_user_data);
 }
 ```
 
-#### 2. Eval Callback for Expert Data Extraction
+#### 4. Eval Callback for Expert Data Extraction
 
 Use the `ggml_backend_sched_eval_callback` to extract expert indices:
 
@@ -196,26 +235,41 @@ bool llama_expert_trace_eval_cb(struct ggml_tensor * t, bool ask, void * user_da
     }
 
     if (ask) {
-        // We want to see MUL_MAT_ID operations (expert computation)
-        return t->op == GGML_OP_MUL_MAT_ID;
+        // We only want to see MUL_MAT_ID operations for the gate (expert selection)
+        // The gate tensor is named "ffn_moe_gate-N" - this is where expert IDs are determined
+        // The up/down tensors use the same expert IDs but for different computations
+        return (t->op == GGML_OP_MUL_MAT_ID) && 
+               (strstr(t->name, "ffn_moe_gate") != nullptr);
     }
 
     // Extract expert IDs from the operation
-    if (t->op == GGML_OP_MUL_MAT_ID) {
+    if (t->op == GGML_OP_MUL_MAT_ID && strstr(t->name, "ffn_moe_gate") != nullptr) {
         // ids tensor is src[2]
         const ggml_tensor * ids = t->src[2];
 
-        // Extract layer number from tensor name (e.g., "blk.5.ffn_moe_...")
+        // Extract layer number from tensor name (e.g., "ffn_moe_gate-0")
         int layer_id = extract_layer_id(t->name);
 
-        // Copy expert IDs to host (small tensor, safe to copy)
-        std::vector<int32_t> expert_ids(ggml_nelements(ids));
-        ggml_backend_tensor_get(ids, expert_ids.data(), 0, ggml_nbytes(ids));
+        // Copy expert IDs to host
+        // The tensor has shape [ne[0], ne[1]] = [experts_per_token, n_tokens]
+        // There might be padding between rows, so we read row by row using nb[1] stride
+        std::vector<int32_t> expert_ids;
+        expert_ids.reserve(ggml_nelements(ids));
+        
+        for (int64_t i = 0; i < ids->ne[1]; i++) {
+            size_t offset = i * ids->nb[1];
+            size_t row_size = ids->ne[0] * sizeof(int32_t);
+            std::vector<int32_t> row(ids->ne[0]);
+            ggml_backend_tensor_get(ids, row.data(), offset, row_size);
+            expert_ids.insert(expert_ids.end(), row.begin(), row.end());
+        }
 
         // Update statistics
         std::lock_guard<std::mutex> lock(g_expert_trace.trace_mutex);
         for (int32_t expert_id : expert_ids) {
-            g_expert_trace.layer_expert_counts[layer_id][expert_id]++;
+            if (expert_id >= 0) {
+                g_expert_trace.layer_expert_counts[layer_id][expert_id]++;
+            }
         }
 
         if (g_expert_trace.enable_logging) {
@@ -230,6 +284,16 @@ bool llama_expert_trace_eval_cb(struct ggml_tensor * t, bool ask, void * user_da
     return true;
 }
 ```
+
+**Key Implementation Notes:**
+
+1. **Filter for gate operations only** - The MoE layer has three MUL_MAT_ID operations (gate, up, down). Only the gate operation should be processed to avoid triple-counting experts.
+
+2. **Tensor naming** - Actual tensor names are `ffn_moe_gate-N`, `ffn_moe_up-N`, `ffn_moe_down-N` where N is the layer number.
+
+3. **Handle tensor padding** - The ids tensor may have padding between rows. Use `nb[1]` stride to read row by row.
+
+4. **Return bool** - The callback must return `true` to continue execution.
 
 #### 3. Integration with Post-Fetch
 
@@ -298,42 +362,28 @@ Instead of command-line flags, use environment variables (llama.cpp convention):
 | `LLAMA_EXPERT_TRACE_STATS` | `0` or `1` | Enable activation counting via callbacks |
 | `LLAMA_EXPERT_TRACE_LOGGING` | `0` or `1` | Print expert IDs during execution |
 | `LLAMA_EXPERT_TRACE_OUTPUT` | File path | Export statistics to JSON file |
-| `LLAMA_EXPERT_TRACE_VERBOSE` | `0` or `1` | Include full selection pipeline (all 23 callbacks) |
 
 
 ### Initialization Code
 
 ```cpp
-// In llama_new_context_with_model() or similar
-void init_expert_trace(llama_context * ctx) {
-    // Read environment variables
-    const char* env_stats = std::getenv("LLAMA_EXPERT_TRACE_STATS");
-    g_expert_trace.enable_stats = (env_stats && std::string(env_stats) == "1");
-
-    const char* env_log = std::getenv("LLAMA_EXPERT_TRACE_LOGGING");
-    g_expert_trace.enable_logging = (env_log && std::string(env_log) == "1");
-
-    if (!g_expert_trace.enable_stats && !g_expert_trace.enable_logging) {
-        return; // Tracing disabled
-    }
-
-    LLAMA_LOG_INFO("Expert tracing enabled (stats=%d, logging=%d)\n",
-            g_expert_trace.enable_stats, g_expert_trace.enable_logging);
-
-    // Set graph callback (if using llm_graph_cb)
-    // ctx->graph_callback = llama_expert_trace_graph_cb;
-
-    // Set eval callback
-    ggml_backend_sched_set_eval_callback(
-        ctx->get_sched(),
-        llama_expert_trace_eval_cb,
-        nullptr  // user_data not needed (using global state)
-    );
+// In llama_init_from_model() - BEFORE context creation
+// Initialize expert tracer config and set trace callback if enabled
+llama_expert_tracer::instance().init_config();
+if (llama_expert_tracer::instance().is_enabled()) {
+    params.cb_trace = llama_expert_trace_eval_cb;
+    params.cb_trace_user_data = nullptr;  // Will be set to ctx after creation
 }
+
+// Create context
+auto * ctx = new llama_context(*model, params);
+
+// After context creation - clear any previous statistics
+llama_expert_tracer::instance().init(ctx);
 
 // In llama_free() or similar
 void cleanup_expert_trace(llama_context * ctx) {
-    if (!g_expert_trace.enable_stats) {
+    if (!llama_expert_tracer::instance().is_enabled()) {
         return;
     }
 

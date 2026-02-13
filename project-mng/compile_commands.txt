@@ -1,0 +1,4 @@
+Build with CUDA
+
+cmake -B ../llama-prefetch.cpp-build-cuda -DGGML_CUDA=ON
+cmake --build ../llama-prefetch.cpp-build-cuda --config Release -j 32

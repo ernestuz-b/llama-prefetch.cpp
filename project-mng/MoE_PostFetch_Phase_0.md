@@ -1,22 +1,23 @@
 # Phase 0 Implementation Guide: Expert Usage Tracer
 
-**Version:** 1.0  
+**Version:** 1.2  
 **Status:** Implementation Guide  
 **Target:** llama.cpp MoE Optimization - Phase 0  
-**Date:** 2026-02-09
+**Date:** 2026-02-13
 
 ---
 
 ## Table of Contents
 
 1. [Overview](#overview)
-2. [Design Principles](#design-principles)
-3. [File Structure](#file-structure)
-4. [Implementation Steps](#implementation-steps)
-5. [Code Style Guidelines](#code-style-guidelines)
-6. [Testing Strategy](#testing-strategy)
-7. [Integration Checklist](#integration-checklist)
-8. [Troubleshooting](#troubleshooting)
+2. [Callback Infrastructure](#callback-infrastructure)
+3. [Design Principles](#design-principles)
+4. [File Structure](#file-structure)
+5. [Implementation Steps](#implementation-steps)
+6. [Code Style Guidelines](#code-style-guidelines)
+7. [Testing Strategy](#testing-strategy)
+8. [Integration Checklist](#integration-checklist)
+9. [Troubleshooting](#troubleshooting)
 
 ---
 
@@ -26,7 +27,7 @@
 
 Phase 0 implements a **single-file expert usage tracer** that tracks which experts are activated during MoE model inference. This tracer:
 
-- Uses llama.cpp's existing callback infrastructure (non-invasive)
+- Uses a dedicated `cb_trace` callback infrastructure (non-invasive, no collisions)
 - Provides runtime statistics on expert activation patterns
 - Exports data to JSON for analysis
 - Has zero overhead when disabled (controlled by environment variables)
@@ -35,11 +36,94 @@ Phase 0 implements a **single-file expert usage tracer** that tracks which exper
 
 | Feature | Description |
 |---------|-------------|
-| **Callback-Based** | Leverages `llm_graph_cb` and `ggml_backend_sched_eval_callback` |
+| **Dedicated Callback** | Uses `cb_trace` member, separate from user's `cb_eval` |
 | **Zero Overhead** | No cost when environment variables not set |
 | **Optional** | Controlled via `LLAMA_EXPERT_TRACE_*` environment variables |
-| **Single File** | All implementation in `common/expert-trace.cpp` |
+| **Single File** | All implementation in `src/llama-expert-trace.cpp` |
 | **Well-Documented** | Clear header comments and inline documentation |
+| **No Collisions** | Dedicated callback slot prevents conflicts with user callbacks |
+
+### Implementation Status
+
+**COMPLETED** - This feature has been implemented and tested with GPT-OSS-20B model.
+
+---
+
+## Callback Infrastructure
+
+### The Problem with the Original Approach
+
+The original implementation attempted to use `ggml_backend_sched_set_eval_callback()` directly, but this caused a critical issue:
+
+1. Expert tracer sets callback in `init()`
+2. Graph build loop at `llama-context.cpp:1141` calls `ggml_backend_sched_set_eval_callback(sched.get(), cparams.cb_eval, ...)` 
+3. This **overwrites** the expert tracer's callback with `nullptr` (the default)
+
+### Solution: Dedicated `cb_trace` Callback
+
+To avoid collisions with user callbacks and the overwrite issue, we add a dedicated callback member:
+
+```cpp
+// In llama_context_params (include/llama.h)
+struct llama_context_params {
+    // ... existing members ...
+    
+    // User's callback (existing)
+    ggml_backend_sched_eval_callback cb_eval;
+    void * cb_eval_user_data;
+    
+    // Tracing callback (internal, for expert tracing, prefetching, etc.)
+    ggml_backend_sched_eval_callback cb_trace = nullptr;  // MUST be initialized to nullptr
+    void * cb_trace_user_data = nullptr;                   // MUST be initialized to nullptr
+};
+```
+
+### Why Not Functors?
+
+While C++ functors (function objects) would provide better type safety and state encapsulation, llama.cpp uses C-style function pointers for callbacks because:
+
+1. **C API compatibility** - llama.cpp exposes a C API for bindings
+2. **Simplicity** - Function pointers are simpler and more portable
+3. **Historical reasons** - The codebase predates modern C++ practices
+4. **Performance** - Function pointers have minimal overhead
+
+### Callback Signature
+
+The `cb_trace` uses the same signature as `cb_eval` for consistency:
+
+```cpp
+typedef bool (*ggml_backend_sched_eval_callback)(
+    struct ggml_tensor * t,      // The tensor being processed
+    bool ask,                     // true = query, false = execute
+    void * user_data              // User-provided context
+);
+```
+
+**IMPORTANT:** The callback must return `bool`:
+- In "ask" phase: Return `true` to intercept this tensor, `false` to skip
+- In "execute" phase: Return `true` to continue, `false` to abort
+
+### Files Modified for Callback Infrastructure
+
+| File | Change |
+|------|--------|
+| `include/llama.h` | Add `cb_trace` and `cb_trace_user_data` to `llama_context_params` |
+| `src/llama-cparams.h` | Add same members to `llama_cparams` |
+| `src/llama-context.cpp` | Copy params to cparams, set trace callback in graph build loop |
+| `ggml/include/ggml-backend.h` | Add `ggml_backend_sched_set_trace_callback()` |
+| `ggml/src/ggml-backend.cpp` | Add to scheduler struct, invoke in evaluation loop |
+
+### Future: Prefetch Callback
+
+The same infrastructure can be extended for prefetching:
+
+```cpp
+// Future extension in llama_context_params
+ggml_backend_sched_eval_callback cb_prefetch = nullptr;
+void * cb_prefetch_user_data = nullptr;
+```
+
+This allows the prefetch system to receive expert IDs and initiate async transfers without interfering with tracing or user callbacks.
 
 ### Target Models
 
@@ -157,18 +241,24 @@ namespace llama {
  *   LLAMA_EXPERT_TRACE_OUTPUT=<file> - Export statistics to JSON file
  *
  * Usage:
- *   // Initialize (typically in llama_new_context_with_model)
- *   llama::expert_tracer::instance().init(ctx);
+ *   // Initialize config BEFORE context creation (in llama_init_from_model)
+ *   llama_expert_tracer::instance().init_config();
+ *   if (llama_expert_tracer::instance().is_enabled()) {
+ *       params.cb_trace = llama_expert_trace_eval_cb;
+ *   }
+ *
+ *   // After context creation
+ *   llama_expert_tracer::instance().init(ctx);
  *
  *   // Cleanup (typically in llama_free)
- *   llama::expert_tracer::instance().cleanup(ctx);
+ *   llama_expert_tracer::instance().cleanup(ctx);
  *
  * Performance:
  *   - Zero overhead when disabled (env vars not set)
  *   - <1% overhead when stats enabled
  *   - 5-10% overhead when logging enabled (due to I/O)
  */
-class expert_tracer {
+struct llama_expert_tracer {
 public:
     // Configuration loaded from environment variables
     struct config {
@@ -188,10 +278,17 @@ public:
     };
 
     // Singleton instance
-    static expert_tracer & instance();
+    static llama_expert_tracer & instance();
 
-    // Initialize tracer for a context
-    // Loads configuration from environment variables and registers callbacks
+    // Check if tracing is enabled (call before context creation)
+    bool is_enabled() const { return m_config.enable_stats || m_config.enable_logging; }
+
+    // Initialize tracer configuration from environment variables
+    // Must be called before context creation to set up cb_trace
+    void init_config();
+
+    // Initialize tracer for a context (called after context creation)
+    // Clears any previous statistics
     void init(llama_context * ctx);
 
     // Cleanup and print statistics
@@ -202,7 +299,8 @@ public:
     void on_graph_build(const llama_ubatch & ubatch, ggml_tensor * cur, const char * name, int il);
 
     // Eval callback (primary, for expert ID extraction)
-    void on_eval(struct ggml_tensor * t, bool ask, llama_context * ctx);
+    // Returns bool: true to continue, false to abort
+    bool on_eval(struct ggml_tensor * t, bool ask, llama_context * ctx);
 
     // Get current configuration (for testing)
     const config & get_config() const { return m_config; }
@@ -211,12 +309,12 @@ public:
     const std::unordered_map<int, layer_stats> & get_stats() const { return m_layer_stats; }
 
 private:
-    expert_tracer() = default;
-    ~expert_tracer() = default;
+    llama_expert_tracer() = default;
+    ~llama_expert_tracer() = default;
 
     // Non-copyable, non-movable (singleton)
-    expert_tracer(const expert_tracer &) = delete;
-    expert_tracer & operator=(const expert_tracer &) = delete;
+    llama_expert_tracer(const llama_expert_tracer &) = delete;
+    llama_expert_tracer & operator=(const llama_expert_tracer &) = delete;
 
     // Internal helpers
     void record_expert_usage(int layer_id, int expert_id);
@@ -231,12 +329,10 @@ private:
 
 // C-style callback wrappers (for ggml callback system)
 // These are registered with llama.cpp's callback infrastructure
-void expert_trace_graph_cb(const llama_ubatch & ubatch, ggml_tensor * cur, const char * name, int il);
-bool expert_trace_eval_cb(struct ggml_tensor * t, bool ask, void * user_data);
+void llama_expert_trace_graph_cb(const llama_ubatch & ubatch, ggml_tensor * cur, const char * name, int il);
+bool llama_expert_trace_eval_cb(struct ggml_tensor * t, bool ask, void * user_data);
 
-} // namespace llama
-
-#endif // LLAMA_EXPERT_TRACE_H
+#endif // LLAMA_LLAMA_EXPERT_TRACE_H
 ```
 
 **Style Notes:**
@@ -301,10 +397,17 @@ llama_expert_tracer & llama_expert_tracer::instance() {
 // Initialization / Cleanup
 //
 
-void llama_expert_tracer::init(llama_context * ctx) {
+void llama_expert_tracer::init_config() {
     // Load configuration from environment variables
+    // Must be called BEFORE context creation
     m_config.load_from_env();
+}
 
+bool llama_expert_tracer::is_enabled() const {
+    return m_config.enable_stats || m_config.enable_logging;
+}
+
+void llama_expert_tracer::init(llama_context * ctx) {
     // Early return if tracing disabled (zero overhead)
     if (!m_config.enable_stats && !m_config.enable_logging) {
         return;
@@ -315,14 +418,10 @@ void llama_expert_tracer::init(llama_context * ctx) {
 
     // Clear any previous statistics
     m_layer_stats.clear();
-
-    // Register eval callback
-    // Note: ctx->get_sched() returns the ggml_backend_sched pointer
-    ggml_backend_sched_set_eval_callback(
-        ctx->get_sched(),
-        llama_expert_trace_eval_cb,
-        ctx
-    );
+    
+    // Note: The trace callback is now set via params.cb_trace before context creation,
+    // so it gets properly copied to cparams.cb_trace and set during graph build.
+    // No need to call ggml_backend_sched_set_trace_callback() here anymore.
 }
 
 void llama_expert_tracer::cleanup(llama_context * ctx) {
@@ -383,52 +482,60 @@ void llama_expert_tracer::on_graph_build(
 void llama_expert_tracer::on_eval(struct ggml_tensor * t, bool ask, llama_context * ctx) {
     // In "ask" phase, return true for operations we want to intercept
     if (ask) {
-        // We want to see MUL_MAT_ID operations (expert computation)
-        return (t->op == GGML_OP_MUL_MAT_ID);
+        // We only want to see MUL_MAT_ID operations for the gate (expert selection)
+        // The gate tensor is named "ffn_moe_gate-N" - this is where expert IDs are determined
+        // The up/down tensors use the same expert IDs but for different computations
+        return (t->op == GGML_OP_MUL_MAT_ID) && 
+               (strstr(t->name, "ffn_moe_gate") != nullptr);
     }
 
     // In "execute" phase, process the operation
     if (t->op != GGML_OP_MUL_MAT_ID) {
-        return;
+        return true;
+    }
+
+    // Only process gate operations to avoid triple-counting (gate, up, down)
+    if (strstr(t->name, "ffn_moe_gate") == nullptr) {
+        return true;
     }
 
     // Extract expert IDs from the operation
     // For GGML_OP_MUL_MAT_ID, the ids tensor is src[2]
     const ggml_tensor * ids = t->src[2];
     if (!ids) {
-        return;
+        return true;
     }
 
     // Extract layer ID from tensor name
-    // Tensor names are like "blk.5.ffn_moe_..."
+    // Tensor names are like "ffn_moe_gate-0" or "blk.5.ffn_moe_..."
     int layer_id = extract_layer_id(t->name);
     if (layer_id < 0) {
         // Could not parse layer ID, skip
-        return;
+        return true;
     }
 
-    // Copy expert IDs to host (small tensor, safe to copy)
-    std::vector<int32_t> expert_ids(ggml_nelements(ids));
-    ggml_backend_tensor_get(ids, expert_ids.data(), 0, ggml_nbytes(ids));
+    // Copy expert IDs to host
+    // The tensor has shape [ne[0], ne[1]] = [experts_per_token, n_tokens]
+    // There might be padding between rows, so we read row by row using nb[1] stride
+    std::vector<int32_t> expert_ids;
+    expert_ids.reserve(ggml_nelements(ids));
+    
+    for (int64_t i = 0; i < ids->ne[1]; i++) {
+        size_t offset = i * ids->nb[1];
+        size_t row_size = ids->ne[0] * sizeof(int32_t);
+        std::vector<int32_t> row(ids->ne[0]);
+        ggml_backend_tensor_get(ids, row.data(), offset, row_size);
+        expert_ids.insert(expert_ids.end(), row.begin(), row.end());
+    }
 
     // Update statistics
     for (int32_t expert_id : expert_ids) {
-        record_expert_usage(layer_id, expert_id);
+        if (expert_id >= 0) {  // Sanity check
+            record_expert_usage(layer_id, expert_id);
+        }
     }
 
-    // Logging (if enabled)
-    if (m_config.enable_logging) {
-        std::stringstream ss;
-        ss << "[EXPERT-TRACE] Layer " << layer_id << ": Experts [";
-        for (size_t i = 0; i < expert_ids.size(); i++) {
-            ss << expert_ids[i];
-            if (i + 1 < expert_ids.size()) {
-                ss << ", ";
-            }
-        }
-        ss << "]\n";
-        LLAMA_LOG_DEBUG("%s", ss.str().c_str());
-    }
+    return true;
 }
 
 //
@@ -451,14 +558,22 @@ void llama_expert_tracer::record_expert_usage(int layer_id, int expert_id) {
 }
 
 int llama_expert_tracer::extract_layer_id(const char * tensor_name) {
-    // Extract layer ID from tensor name like "blk.5.ffn_moe_..."
+    // Extract layer ID from tensor name like "ffn_moe_gate-0" or "blk.5.ffn_moe_..."
     // Returns -1 if parsing fails
 
     std::string name(tensor_name);
-    std::regex pattern(R"(blk\.(\d+)\.)");
+    
+    // Try pattern "blk.N." first
+    std::regex pattern_blk(R"(blk\.(\d+)\.)");
     std::smatch match;
 
-    if (std::regex_search(name, match, pattern)) {
+    if (std::regex_search(name, match, pattern_blk)) {
+        return std::stoi(match[1].str());
+    }
+    
+    // Try pattern "-N" at the end (e.g., "ffn_moe_gate-0")
+    std::regex pattern_dash(R"(-(\d+)$)");
+    if (std::regex_search(name, match, pattern_dash)) {
         return std::stoi(match[1].str());
     }
 
@@ -540,30 +655,149 @@ bool llama_expert_trace_eval_cb(struct ggml_tensor * t, bool ask, void * user_da
 
 ---
 
-### Step 3: Modify `src/llama.cpp`
+### Step 3: Add Callback Infrastructure to Core Structures
 
-**Location:** `src/llama.cpp`
+**Location:** Multiple files
+
+#### 3a. Modify `include/llama.h`
+
+Add `cb_trace` members to `llama_context_params`:
+
+```cpp
+struct llama_context_params {
+    // ... existing members ...
+    
+    // User's callback (existing)
+    ggml_backend_sched_eval_callback cb_eval;
+    void * cb_eval_user_data;
+    
+    // Tracing callback (internal, for expert tracing, prefetching, etc.)
+    // IMPORTANT: Must be initialized to nullptr in the definition
+    ggml_backend_sched_eval_callback cb_trace = nullptr;
+    void * cb_trace_user_data = nullptr;
+};
+```
+
+#### 3b. Modify `src/llama-cparams.h`
+
+Add same members to `llama_cparams`:
+
+```cpp
+struct llama_cparams {
+    // ... existing members ...
+    
+    ggml_backend_sched_eval_callback cb_eval;
+    void * cb_eval_user_data;
+    
+    // Tracing callback - MUST be initialized to nullptr
+    ggml_backend_sched_eval_callback cb_trace = nullptr;
+    void * cb_trace_user_data = nullptr;
+};
+```
+
+#### 3c. Modify `src/llama-context.cpp`
+
+1. Copy params to cparams (around line 62):
+
+```cpp
+cparams.cb_eval           = params.cb_eval;
+cparams.cb_eval_user_data = params.cb_eval_user_data;
+
+// Copy trace callback
+cparams.cb_trace           = params.cb_trace;
+cparams.cb_trace_user_data = params.cb_trace_user_data;
+```
+
+2. Set the trace callback in the graph build loop (around line 1141):
+
+```cpp
+ggml_backend_sched_reset(sched.get());
+ggml_backend_sched_set_eval_callback(sched.get(), cparams.cb_eval, cparams.cb_eval_user_data);
+
+// Set trace callback (if provided)
+if (cparams.cb_trace) {
+    ggml_backend_sched_set_trace_callback(sched.get(), cparams.cb_trace, cparams.cb_trace_user_data);
+}
+```
+
+#### 3d. Modify `ggml/include/ggml-backend.h`
+
+Add the trace callback setter:
+
+```cpp
+// Set a callback for tracing/instrumentation (separate from user callback)
+GGML_API void ggml_backend_sched_set_trace_callback(
+    ggml_backend_sched_t sched,
+    ggml_backend_sched_eval_callback callback,
+    void * user_data
+);
+```
+
+#### 3e. Modify `ggml/src/ggml-backend.cpp`
+
+1. Add to scheduler struct (around line 724):
+
+```cpp
+struct ggml_backend_sched {
+    // ... existing members ...
+    
+    ggml_backend_sched_eval_callback callback_eval;
+    void * callback_eval_user_data;
+    
+    // Trace callback (for expert tracing, prefetching, etc.)
+    ggml_backend_sched_eval_callback callback_trace = nullptr;
+    void * callback_trace_user_data = nullptr;
+};
+```
+
+2. Add the setter function (after `ggml_backend_sched_set_eval_callback`):
+
+```cpp
+void ggml_backend_sched_set_trace_callback(
+    ggml_backend_sched_t sched,
+    ggml_backend_sched_eval_callback callback,
+    void * user_data
+) {
+    GGML_ASSERT(sched);
+    sched->callback_trace = callback;
+    sched->callback_trace_user_data = user_data;
+}
+```
+
+3. Invoke the trace callback in the evaluation loop (around line 1612):
+
+```cpp
+if (need && !sched->callback_eval(t, false, sched->callback_eval_user_data)) {
+    break;
+}
+
+// Also invoke trace callback (if set)
+if (sched->callback_trace) {
+    sched->callback_trace(t, false, sched->callback_trace_user_data);
+}
+```
+
+---
+
+### Step 4: Modify `src/llama-context.cpp` for Expert Tracer Integration
+
+**Location:** `src/llama-context.cpp`
 
 **Changes Required:**
 
 1. Add include at top of file:
 
 ```cpp
-#include "common/expert-trace.h"
+#include "llama-expert-trace.h"
 ```
 
-2. In `llama_new_context_with_model()` function, add initialization:
+2. In `llama_init_from_model()` function, set the trace callback:
 
 ```cpp
-struct llama_context * llama_new_context_with_model(
-        struct llama_model * model,
-        const llama_context_params & params) {
-    // ... existing initialization code ...
-
-    // Initialize expert tracer (Phase 0)
-    llama::expert_tracer::instance().init(ctx);
-
-    return ctx;
+// After context is created, set trace callback if tracing enabled
+if (llama_expert_tracer::instance().is_enabled()) {
+    params.cb_trace = llama_expert_trace_eval_cb;
+    params.cb_trace_user_data = ctx;
 }
 ```
 
@@ -572,46 +806,33 @@ struct llama_context * llama_new_context_with_model(
 ```cpp
 void llama_free(struct llama_context * ctx) {
     // Cleanup expert tracer (Phase 0)
-    llama::expert_tracer::instance().cleanup(ctx);
+    llama_expert_tracer::instance().cleanup(ctx);
 
     // ... existing cleanup code ...
 }
 ```
 
-**Important Notes:**
-- Place initialization after context is fully constructed
-- Place cleanup before context is destroyed
-- Use `llama::` namespace prefix (not `using namespace`)
-- Keep changes minimal and localized
-
 ---
 
-### Step 4: Update Build System
+### Step 5: Update Build System
 
-**Location:** `CMakeLists.txt` (or `common/CMakeLists.txt`)
+**Location:** `src/CMakeLists.txt`
 
 **Changes Required:**
 
-Add `expert-trace.cpp` to the common library sources:
+Add `llama-expert-trace.cpp` to the llama library sources:
 
 ```cmake
-# In common/CMakeLists.txt or similar
-set(COMMON_SOURCES
+# In src/CMakeLists.txt
+set(LLAMA_SOURCES
     # ... existing sources ...
-    common/expert-trace.cpp
+    llama-expert-trace.cpp
 )
-```
-
-**Alternative (if using Makefile):**
-
-```makefile
-# In Makefile
-COMMON_OBJS += common/expert-trace.o
 ```
 
 ---
 
-### Step 5: Verify Compilation
+### Step 6: Verify Compilation
 
 **Commands:**
 
@@ -628,7 +849,7 @@ cmake --build build -j$(nproc)
 
 **Expected Output:**
 - No warnings or errors
-- `expert-trace.cpp` compiled successfully
+- `llama-expert-trace.cpp` compiled successfully
 - `llama-cli` binary created
 
 ---
@@ -907,19 +1128,38 @@ error: 'ggml_backend_sched_set_eval_callback' was not declared
 - Check that llama.cpp version supports eval callbacks
 - Verify `ctx->sched` is accessible
 
-**Issue 2: Callback Not Invoked**
+**Issue 2: Callback Not Invoked (Empty trace.json)**
 
 ```
-No expert statistics printed
+trace.json contains: {"layers": []}
+```
+
+**Root Cause:**
+The callback was being overwritten by the graph build loop at `llama-context.cpp:1141`:
+```cpp
+ggml_backend_sched_set_eval_callback(sched.get(), cparams.cb_eval, cparams.cb_eval_user_data);
 ```
 
 **Solution:**
-- Verify environment variables are set: `export LLAMA_EXPERT_TRACE_STATS=1`
-- Check that model is actually MoE (has `ffn_moe_topk` tensor)
-- Enable logging: `export LLAMA_EXPERT_TRACE_LOGGING=1`
-- Check that callback is registered in `init()`
+Use the dedicated `cb_trace` callback infrastructure instead of calling `ggml_backend_sched_set_eval_callback()` directly. The `cb_trace` member is separate from `cb_eval` and won't be overwritten.
 
-**Issue 3: Layer ID Extraction Fails**
+**Verification:**
+- Check that `cb_trace` is set in `llama_context_params`
+- Verify `ggml_backend_sched_set_trace_callback()` is called in the graph build loop
+- Ensure `cb_trace` is invoked in `ggml-backend.cpp` evaluation loop
+
+**Issue 3: Callback Pointer Not Initialized**
+
+```
+Segmentation fault when accessing cb_trace
+```
+
+**Solution:**
+- Ensure `cb_trace` and `cb_trace_user_data` are initialized to `nullptr` in the struct definition
+- Check that the default values are set in both `llama_context_params` and `llama_cparams`
+- Always check for `nullptr` before invoking the callback
+
+**Issue 4: Layer ID Extraction Fails**
 
 ```
 Layer -1: Experts [...]
@@ -930,7 +1170,7 @@ Layer -1: Experts [...]
 - Check that tensor names follow llama.cpp conventions
 - Add debug logging to see actual tensor names
 
-**Issue 4: JSON Export Fails**
+**Issue 5: JSON Export Fails**
 
 ```
 Failed to open output file: expert_stats.json
