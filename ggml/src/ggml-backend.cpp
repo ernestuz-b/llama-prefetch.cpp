@@ -724,6 +724,10 @@ struct ggml_backend_sched {
     ggml_backend_sched_eval_callback callback_eval;
     void * callback_eval_user_data;
 
+    // Trace callback (separate from eval callback for internal tracing infrastructure)
+    ggml_backend_sched_eval_callback callback_trace;
+    void * callback_trace_user_data;
+
     char * context_buffer;
     size_t context_buffer_size;
 
@@ -1578,7 +1582,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             }
         }
 
-        if (!sched->callback_eval) {
+        if (!sched->callback_eval && !sched->callback_trace) {
             enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &split->graph);
             if (ec != GGML_STATUS_SUCCESS) {
                 return ec;
@@ -1589,14 +1593,28 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                 struct ggml_tensor * t = split->graph.nodes[j0];
 
                 // check if the user needs data from this node
-                bool need = sched->callback_eval(t, true, sched->callback_eval_user_data);
+                bool need = false;
+                if (sched->callback_eval) {
+                    need = sched->callback_eval(t, true, sched->callback_eval_user_data);
+                }
+                // also check trace callback
+                if (sched->callback_trace) {
+                    bool need_trace = sched->callback_trace(t, true, sched->callback_trace_user_data);
+                    need = need || need_trace;
+                }
 
                 int j1 = j0;
 
                 // determine the range [j0, j1] of nodes that can be computed together
                 while (!need && j1 < split->graph.n_nodes - 1) {
                     t = split->graph.nodes[++j1];
-                    need = sched->callback_eval(t, true, sched->callback_eval_user_data);
+                    if (sched->callback_eval) {
+                        need = sched->callback_eval(t, true, sched->callback_eval_user_data);
+                    }
+                    if (sched->callback_trace) {
+                        bool need_trace = sched->callback_trace(t, true, sched->callback_trace_user_data);
+                        need = need || need_trace;
+                    }
                 }
 
                 struct ggml_cgraph gv = ggml_graph_view(&split->graph, j0, j1 + 1);
@@ -1609,8 +1627,14 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                 // TODO: pass backend to the callback, then the user can decide if they want to synchronize
                 ggml_backend_synchronize(split_backend);
 
-                if (need && !sched->callback_eval(t, false, sched->callback_eval_user_data)) {
-                    break;
+                // invoke callbacks
+                if (sched->callback_eval) {
+                    if (need && !sched->callback_eval(t, false, sched->callback_eval_user_data)) {
+                        break;
+                    }
+                }
+                if (sched->callback_trace) {
+                    sched->callback_trace(t, false, sched->callback_trace_user_data);
                 }
 
                 j0 = j1;
@@ -1822,6 +1846,12 @@ void ggml_backend_sched_set_eval_callback(ggml_backend_sched_t sched, ggml_backe
     GGML_ASSERT(sched);
     sched->callback_eval = callback;
     sched->callback_eval_user_data = user_data;
+}
+
+void ggml_backend_sched_set_trace_callback(ggml_backend_sched_t sched, ggml_backend_sched_eval_callback callback, void * user_data) {
+    GGML_ASSERT(sched);
+    sched->callback_trace = callback;
+    sched->callback_trace_user_data = user_data;
 }
 
 int ggml_backend_sched_get_n_splits(ggml_backend_sched_t sched) {

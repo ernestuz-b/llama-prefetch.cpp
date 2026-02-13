@@ -41,4 +41,8 @@ struct llama_cparams {
 
     ggml_backend_sched_eval_callback cb_eval;
     void * cb_eval_user_data;
+
+    // Tracing callback, use to get stats to drive run time decisions
+    ggml_backend_sched_eval_callback cb_trace;
+    void * cb_trace_user_data;
 };

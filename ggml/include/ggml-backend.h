@@ -340,6 +340,10 @@ extern "C" {
     // Set a callback to be called for each resulting node during graph compute
     GGML_API void                 ggml_backend_sched_set_eval_callback(ggml_backend_sched_t sched, ggml_backend_sched_eval_callback callback, void * user_data);
 
+    // Set a trace callback to be called for each node during graph compute (separate from eval callback)
+    // This allows internal tracing infrastructure to coexist with user eval callbacks
+    GGML_API void                 ggml_backend_sched_set_trace_callback(ggml_backend_sched_t sched, ggml_backend_sched_eval_callback callback, void * user_data);
+
     //
     // Utils
     //

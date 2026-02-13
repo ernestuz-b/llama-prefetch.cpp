@@ -7,40 +7,34 @@
 #include <fstream>
 #include <sstream>
 
-//
 // Configuration
-//
-
 void llama_expert_tracer::config::load_from_env() {
     const char* env_stats = std::getenv("LLAMA_EXPERT_TRACE_STATS");
-    enable_stats = (env_stats && std::strcmp(env_stats, "1") == 0);
-
     const char* env_logging = std::getenv("LLAMA_EXPERT_TRACE_LOGGING");
+    const char* env_output = std::getenv("LLAMA_EXPERT_TRACE_OUTPUT");
+    
+    enable_stats = (env_stats && std::strcmp(env_stats, "1") == 0);
     enable_logging = (env_logging && std::strcmp(env_logging, "1") == 0);
 
-    const char* env_output = std::getenv("LLAMA_EXPERT_TRACE_OUTPUT");
     if (env_output) {
         output_file = env_output;
     }
 }
 
-//
 // Singleton
-//
-
 llama_expert_tracer & llama_expert_tracer::instance() {
     static llama_expert_tracer instance;
     return instance;
 }
 
-//
-// Initialization / Cleanup
-//
 
-void llama_expert_tracer::init(llama_context * ctx) {
+// Initialization / Cleanup
+void llama_expert_tracer::init_config() {
     // Load configuration from environment variables
     m_config.load_from_env();
+}
 
+void llama_expert_tracer::init(llama_context * ctx) {
     // Early return if tracing disabled (zero overhead)
     if (!m_config.enable_stats && !m_config.enable_logging) {
         return;
@@ -51,13 +45,10 @@ void llama_expert_tracer::init(llama_context * ctx) {
 
     // Clear any previous statistics
     m_layer_stats.clear();
-
-    // Register eval callback, ctx->get_sched() returns the ggml_backend_sched pointer
-    ggml_backend_sched_set_eval_callback(
-        ctx->get_sched(),
-        llama_expert_trace_eval_cb,
-        ctx
-    );
+    
+    // Note: The trace callback is now set via params.cb_trace before context creation,
+    // so it gets properly copied to cparams.cb_trace and set during graph build.
+    // No need to call ggml_backend_sched_set_trace_callback() here anymore.
 }
 
 void llama_expert_tracer::cleanup(llama_context * ctx) {
@@ -67,7 +58,7 @@ void llama_expert_tracer::cleanup(llama_context * ctx) {
     }
 
     // Print statistics to log
-    LLAMA_LOG_INFO("\n Expert Usage Statistics: \n");
+    LLAMA_LOG_INFO("\n=== Expert Usage Statistics ===\n");
     for (const auto & [layer_id, stats] : m_layer_stats) {
         LLAMA_LOG_INFO("Layer %d (%d tokens):\n", layer_id, stats.total_tokens);
 
@@ -93,10 +84,8 @@ void llama_expert_tracer::cleanup(llama_context * ctx) {
     }
 }
 
-//
-// Callbacks
-//
 
+// Callbacks
 void llama_expert_tracer::on_graph_build(
     const llama_ubatch & ubatch,
     ggml_tensor * cur,
@@ -115,25 +104,32 @@ void llama_expert_tracer::on_graph_build(
     }
 }
 
-void llama_expert_tracer::on_eval(struct ggml_tensor * t, bool ask, llama_context * ctx) {
+bool llama_expert_tracer::on_eval(struct ggml_tensor * t, bool ask, llama_context * ctx) {
     // In "ask" phase, return true for operations we want to intercept
     if (ask) {
-        // We want to see MUL_MAT_ID operations (expert computation)
-        // Note: This function is called from llama_expert_trace_eval_cb which returns bool
-        // The actual return value is handled by the callback wrapper
-        return;
+        // We only want to see MUL_MAT_ID operations for the gate (expert selection)
+        // The gate tensor is named "ffn_moe_gate-N" - this is where expert IDs are determined
+        // The up/down tensors use the same expert IDs but for different computations
+        return (t->op == GGML_OP_MUL_MAT_ID) && 
+               (strstr(t->name, "ffn_moe_gate") != nullptr);
     }
 
     // In "execute" phase, process the operation
     if (t->op != GGML_OP_MUL_MAT_ID) {
-        return;
+        return true;
+    }
+
+    // Only process gate operations to avoid triple-counting (gate, up, down)
+    if (strstr(t->name, "ffn_moe_gate") == nullptr) {
+        return true;
     }
 
     // Extract expert IDs from the operation
     // For GGML_OP_MUL_MAT_ID, the ids tensor is src[2]
     const ggml_tensor * ids = t->src[2];
     if (!ids) {
-        return;
+        fprintf(stderr, "[EXPERT-TRACE] No ids tensor found for MUL_MAT_ID\n");
+        return true;
     }
 
     // Extract layer ID from tensor name
@@ -141,16 +137,34 @@ void llama_expert_tracer::on_eval(struct ggml_tensor * t, bool ask, llama_contex
     int layer_id = extract_layer_id(t->name);
     if (layer_id < 0) {
         // Could not parse layer ID, skip
-        return;
+        fprintf(stderr, "[EXPERT-TRACE] Could not parse layer ID from: %s\n", t->name);
+        return true;
     }
 
-    // Copy expert IDs to host (small tensor, safe to copy)
-    std::vector<int32_t> expert_ids(ggml_nelements(ids));
-    ggml_backend_tensor_get(ids, expert_ids.data(), 0, ggml_nbytes(ids));
+    // Copy expert IDs to host
+    // The tensor has shape [ne[0], ne[1]] = [experts_per_token, n_tokens]
+    // There might be padding between rows, so we read row by row using nb[1] stride
+    
+    std::vector<int32_t> expert_ids;
+    expert_ids.reserve(ggml_nelements(ids));
+    
+    // Read row by row to handle potential padding
+    for (int64_t i = 0; i < ids->ne[1]; i++) {
+        size_t offset = i * ids->nb[1];
+        size_t row_size = ids->ne[0] * sizeof(int32_t);
+        std::vector<int32_t> row(ids->ne[0]);
+        ggml_backend_tensor_get(ids, row.data(), offset, row_size);
+        expert_ids.insert(expert_ids.end(), row.begin(), row.end());
+    }
 
     // Update statistics
-    for (int32_t expert_id : expert_ids) {
-        record_expert_usage(layer_id, expert_id);
+    // Note: expert_ids might contain multiple entries per token (e.g., top-k experts)
+    // We count each expert activation
+    for (size_t i = 0; i < expert_ids.size(); i++) {
+        int32_t expert_id = expert_ids[i];
+        if (expert_id >= 0) {  // Sanity check
+            record_expert_usage(layer_id, expert_id);
+        }
     }
 
     // Logging (if enabled)
@@ -166,6 +180,8 @@ void llama_expert_tracer::on_eval(struct ggml_tensor * t, bool ask, llama_contex
         ss << "]\n";
         LLAMA_LOG_DEBUG("%s", ss.str().c_str());
     }
+
+    return true;
 }
 
 //
@@ -188,14 +204,22 @@ void llama_expert_tracer::record_expert_usage(int layer_id, int expert_id) {
 }
 
 int llama_expert_tracer::extract_layer_id(const char * tensor_name) {
-    // Extract layer ID from tensor name like "blk.5.ffn_moe_..."
+    // Extract layer ID from tensor name like "ffn_moe_gate-0" or "blk.5.ffn_moe_..."
     // Returns -1 if parsing fails
 
     std::string name(tensor_name);
-    std::regex pattern(R"(blk\.(\d+)\.)");
+    
+    // Try pattern "blk.N." first
+    std::regex pattern_blk(R"(blk\.(\d+)\.)");
     std::smatch match;
 
-    if (std::regex_search(name, match, pattern)) {
+    if (std::regex_search(name, match, pattern_blk)) {
+        return std::stoi(match[1].str());
+    }
+    
+    // Try pattern "-N" at the end (e.g., "ffn_moe_gate-0")
+    std::regex pattern_dash(R"(-(\d+)$)");
+    if (std::regex_search(name, match, pattern_dash)) {
         return std::stoi(match[1].str());
     }
 
@@ -262,6 +286,5 @@ void llama_expert_trace_graph_cb(
 
 bool llama_expert_trace_eval_cb(struct ggml_tensor * t, bool ask, void * user_data) {
     llama_context * ctx = static_cast<llama_context *>(user_data);
-    llama_expert_tracer::instance().on_eval(t, ask, ctx);
-    return true;
+    return llama_expert_tracer::instance().on_eval(t, ask, ctx);
 }

@@ -350,6 +350,11 @@ extern "C" {
         ggml_backend_sched_eval_callback cb_eval;
         void * cb_eval_user_data;
 
+        // Tracing callback (internal, for expert tracing, prefetching, etc.)
+        // This is separate from cb_eval to avoid conflicts with user callbacks
+        ggml_backend_sched_eval_callback cb_trace;
+        void * cb_trace_user_data;
+
         enum ggml_type type_k; // data type for K cache [EXPERIMENTAL]
         enum ggml_type type_v; // data type for V cache [EXPERIMENTAL]
 

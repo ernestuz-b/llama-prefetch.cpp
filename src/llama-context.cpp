@@ -62,6 +62,9 @@ llama_context::llama_context(
     cparams.cb_eval           = params.cb_eval;
     cparams.cb_eval_user_data = params.cb_eval_user_data;
 
+    cparams.cb_trace           = params.cb_trace;
+    cparams.cb_trace_user_data = params.cb_trace_user_data;
+
     // Initialize backend samplers here so they are part of the sampling graph
     // before the reserve passes run later in this function. This avoids a later
     // re-reserve when graph nodes change.
@@ -1139,6 +1142,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
         ggml_backend_sched_reset(sched.get());
         ggml_backend_sched_set_eval_callback(sched.get(), cparams.cb_eval, cparams.cb_eval_user_data);
+        ggml_backend_sched_set_trace_callback(sched.get(), cparams.cb_trace, cparams.cb_trace_user_data);
 
         //const auto t_start_us = ggml_time_us();
 
@@ -2972,6 +2976,8 @@ llama_context_params llama_context_default_params() {
         /*.defrag_thold                =*/ -1.0f,
         /*.cb_eval                     =*/ nullptr,
         /*.cb_eval_user_data           =*/ nullptr,
+        /*.cb_trace                    =*/ nullptr,
+        /*.cb_trace_user_data          =*/ nullptr,
         /*.type_k                      =*/ GGML_TYPE_F16,
         /*.type_v                      =*/ GGML_TYPE_F16,
         /*.abort_callback              =*/ nullptr,
@@ -3042,9 +3048,18 @@ llama_context * llama_init_from_model(
                        model->hparams.pooling_type, params.pooling_type);
     }
 
+    // Initialize expert tracer config and set trace callback if enabled
+    // This must be done BEFORE context creation so cb_trace is properly set
+    llama_expert_tracer::instance().init_config();
+    if (llama_expert_tracer::instance().is_enabled()) {
+        params.cb_trace = llama_expert_trace_eval_cb;
+        params.cb_trace_user_data = nullptr;  // Will be set to ctx after creation
+    }
+
     try {
         auto * ctx = new llama_context(*model, params);
-        // Initialize expert tracer (Phase 0)
+        // Set the user_data to the context now that it's created
+        // Note: This is safe because the callback uses the singleton, not user_data directly
         llama_expert_tracer::instance().init(ctx);
         return ctx;
     } catch (const std::exception & err) {

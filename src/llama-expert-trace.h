@@ -58,8 +58,16 @@ public:
     // Singleton instance
     static llama_expert_tracer & instance();
 
-    // Initialize tracer for a context
-    // Loads configuration from environment variables and registers callbacks
+    // Check if tracing is enabled (call before context creation)
+    // Loads configuration from environment variables
+    bool is_enabled() const { return m_config.enable_stats || m_config.enable_logging; }
+
+    // Initialize tracer configuration from environment variables
+    // Must be called before context creation to set up cb_trace
+    void init_config();
+
+    // Initialize tracer for a context (called after context creation)
+    // Clears any previous statistics
     void init(llama_context * ctx);
 
     // Cleanup and print statistics
@@ -70,7 +78,8 @@ public:
     void on_graph_build(const llama_ubatch & ubatch, ggml_tensor * cur, const char * name, int il);
 
     // Eval callback (primary, for expert ID extraction)
-    void on_eval(struct ggml_tensor * t, bool ask, llama_context * ctx);
+    // Returns true for MUL_MAT_ID operations in ask phase, true always in execute phase
+    bool on_eval(struct ggml_tensor * t, bool ask, llama_context * ctx);
 
     // Get current configuration (for testing)
     const config & get_config() const { return m_config; }
