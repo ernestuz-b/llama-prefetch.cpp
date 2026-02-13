@@ -1,4 +1,11 @@
 Build with CUDA
-
+From the project root dirtectory:
 cmake -B ../llama-prefetch.cpp-build-cuda -DGGML_CUDA=ON
 cmake --build ../llama-prefetch.cpp-build-cuda --config Release -j 32
+
+Test
+export LLAMA_POSTFETCH_ENABLE=1 && export LLAMA_POSTFETCH_DEBUG=1 && export LLAMA_EXPERT_TRACE_STATS=1 && export LLAMA_EXPERT_TRACE_LOGGING=1 && export LLAMA_EXPERT_TRACE_OUTPUT=trace.json
+
+../llama-prefetch.cpp-build-cuda/bin/llama-bench -p 256 -n 32 -t 8 -ngl 0 -ub 2048 -b 4096 -m /mnt/AI/AiProgs/LM-Studio/models/unsloth/gpt-oss-20b-GGUF/gpt-oss-20b-Q4_K_M.gguf
+
+
